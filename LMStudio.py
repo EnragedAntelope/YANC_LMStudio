@@ -89,14 +89,14 @@ class YANCLMStudio:
                     "default": 1024,
                     "min": 1,
                     "max": 131072,
-                    "step": 64,
+                    "step": 1,
                     "tooltip": "Maximum tokens in the response. Longer responses need more tokens. 1 token ~ 4 characters."
                 }),
                 "seed": ("INT", {
                     "default": 0,
                     "min": 0,
                     "max": 0xffffffffffffffff,
-                    "tooltip": "Random seed for reproducible outputs. Use same seed + settings for identical results. 0 = random."
+                    "tooltip": "Seed for ComfyUI workflow reproducibility. Note: LM Studio SDK does not support inference-time seeding."
                 }),
             },
             "optional": {
@@ -372,12 +372,12 @@ class YANCLMStudio:
                 }
 
                 # Add optional parameters if not at default
+                # Note: Parameter names per LM Studio SDK docs (topPSampling, not topP)
                 if top_p < 1.0:
-                    gen_config["topP"] = top_p
+                    gen_config["topPSampling"] = top_p
                 if repeat_penalty != 1.0:
                     gen_config["repeatPenalty"] = repeat_penalty
-                if seed > 0:
-                    gen_config["seed"] = seed
+                # Note: seed is not a valid inference-time parameter in LM Studio SDK
                 if draft_model:
                     gen_config["draftModel"] = draft_model
 
