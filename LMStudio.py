@@ -4,10 +4,9 @@ Provides text generation using local LLM/VLM models via LM Studio server.
 """
 import logging
 from typing import Optional, Tuple
+from tempfile import NamedTemporaryFile
 import numpy as np
 from PIL import Image
-import io
-import base64
 
 # LM Studio SDK
 import lmstudio as lms
@@ -180,8 +179,8 @@ class YANCLMStudio:
 
         return model_id, None
 
-    def _convert_image_to_base64(self, image_tensor) -> Optional[str]:
-        """Convert ComfyUI image tensor to base64 string for vision models."""
+    def _convert_image_to_pil(self, image_tensor) -> Optional[Image.Image]:
+        """Convert ComfyUI image tensor to PIL Image for vision models."""
         try:
             # ComfyUI images are [B, H, W, C] float tensors in 0-1 range
             if image_tensor is None:
@@ -197,14 +196,7 @@ class YANCLMStudio:
             img_array = (img_array * 255).astype(np.uint8)
 
             # Create PIL Image
-            pil_image = Image.fromarray(img_array)
-
-            # Convert to base64
-            buffer = io.BytesIO()
-            pil_image.save(buffer, format="PNG")
-            base64_string = base64.b64encode(buffer.getvalue()).decode('utf-8')
-
-            return base64_string
+            return Image.fromarray(img_array)
 
         except Exception as e:
             logger.error(f"Failed to convert image: {e}")
@@ -336,10 +328,10 @@ class YANCLMStudio:
             model_management.soft_empty_cache()
 
         # Prepare image for vision models
-        image_base64 = None
+        pil_image = None
         if image is not None:
-            image_base64 = self._convert_image_to_base64(image)
-            if image_base64:
+            pil_image = self._convert_image_to_pil(image)
+            if pil_image:
                 troubleshooting_lines.append("[INFO] Image prepared for vision model")
             else:
                 troubleshooting_lines.append("[WARNING] Failed to process image input")
@@ -351,9 +343,10 @@ class YANCLMStudio:
             # Parse host and port from config
             host = config.get("server_host", "127.0.0.1")
             port = config.get("server_port", 1234)
+            server_address = f"{host}:{port}"
 
             # Create LM Studio client
-            with lms.Client(host=host, port=port) as client:
+            with lms.Client(server_address) as client:
                 # Load or get model
                 model = client.llm.model(model_identifier)
                 troubleshooting_lines.append(f"[INFO] Model loaded: {model_identifier}")
@@ -362,12 +355,13 @@ class YANCLMStudio:
                 chat = lms.Chat(system_message)
 
                 # Add user message (with optional image)
-                if image_base64:
-                    # For vision models, include image
-                    chat.add_user_message([
-                        {"type": "image", "image": image_base64},
-                        {"type": "text", "text": prompt}
-                    ])
+                if pil_image:
+                    # For vision models, save to temp file and use SDK's prepare_image
+                    with NamedTemporaryFile(suffix=".jpg", delete=False) as temp:
+                        pil_image.save(temp, format="JPEG")
+                        temp.flush()
+                        image_handle = client.files.prepare_image(temp.name)
+                    chat.add_user_message(prompt, images=[image_handle])
                 else:
                     chat.add_user_message(prompt)
 
