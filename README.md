@@ -56,6 +56,29 @@ The node supports up to 4 image inputs for vision-language models:
 
 **Note:** Not all VLMs support multiple images. If you get errors with multiple images, try using only `image1`.
 
+## Reasoning Extraction
+
+Many reasoning models (DeepSeek R1, Qwen3, QwQ, GLM-Z1) wrap their "thinking" process in special tags. The node can extract this separately from the final response.
+
+### Modes
+
+- **Auto-detect (recommended)**: Automatically detects common reasoning patterns:
+  - `<think>...</think>` - DeepSeek R1, Qwen3, QwQ, GLM-Z1
+  - `<thinking>...</thinking>` - Alternative format
+  - `<reasoning>...</reasoning>` - Some models
+  - GPT-OSS analysis channel format
+
+- **Disabled**: Returns the full response as-is (no extraction)
+
+- **Custom tags**: Specify your own open/close tags for models with unique formats
+
+### Output
+
+- **response**: Final answer with reasoning tags removed (if extracted)
+- **reasoning**: Extracted thinking/reasoning content
+
+This allows you to route reasoning to a separate display or log while keeping the final response clean.
+
 ## Custom Server Address
 
 Default: `http://127.0.0.1:1234`
@@ -86,7 +109,9 @@ This file survives git updates.
 |-----------|---------|-------------|
 | image_resize | Medium (768px) | Resize images before VLM processing |
 | top_p | 1.0 | Nucleus sampling (lower=more focused) |
+| top_k | 0 | Limits vocabulary (0=disabled, 20-40 recommended for thinking models) |
 | repeat_penalty | 1.0 | Reduce repetition (1.1-1.3 recommended) |
+| reasoning_mode | Auto-detect | How to extract reasoning from response |
 | unload_llm | True | Unload LLM after generation (recommended) |
 
 ### Understanding max_tokens vs Context Length

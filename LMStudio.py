@@ -3,6 +3,7 @@ YANC LM Studio Node - ComfyUI integration for LM Studio
 Provides text generation using local LLM/VLM models via LM Studio server.
 """
 import logging
+import re
 from typing import Optional, Tuple, List
 from tempfile import NamedTemporaryFile
 import numpy as np
@@ -58,11 +59,36 @@ RESIZE_DIMENSIONS = {
     "Ultra (1536px)": 1536,
 }
 
+# Reasoning extraction modes
+REASONING_MODE_OPTIONS = [
+    "Auto-detect (recommended)",
+    "Disabled",
+    "Custom tags",
+]
+
+# Common reasoning tag patterns used by different models
+# Order matters - most common first for efficiency
+COMMON_REASONING_PATTERNS = [
+    # DeepSeek R1, Qwen3, QwQ, GLM-4/Z1 - most common
+    (r"<think>(.*?)</think>", "<think>", "</think>"),
+    # Alternative spelling
+    (r"<thinking>(.*?)</thinking>", "<thinking>", "</thinking>"),
+    # Some models use this
+    (r"<reasoning>(.*?)</reasoning>", "<reasoning>", "</reasoning>"),
+    # Occasionally seen
+    (r"<reason>(.*?)</reason>", "<reason>", "</reason>"),
+    # GPT-OSS style (simplified pattern for the analysis channel)
+    (r"<\|start\|>assistant<\|channel\|>analysis<\|message\|>(.*?)<\|end\|>",
+     "<|start|>assistant<|channel|>analysis<|message|>", "<|end|>"),
+]
+
 
 class YANCLMStudio:
     """
     LM Studio integration node for ComfyUI.
     Queries local LM Studio server for text generation with LLM/VLM models.
+
+    Note: model.respond() automatically applies the model's chat template.
     """
 
     CATEGORY = "YANC/LMStudio"
@@ -153,7 +179,14 @@ class YANCLMStudio:
                     "min": 0.0,
                     "max": 1.0,
                     "step": 0.05,
-                    "tooltip": "Nucleus sampling threshold. Lower values (0.1-0.9) = more focused. 1.0 = disabled."
+                    "tooltip": "Nucleus sampling: only consider tokens with cumulative probability >= top_p. Lower = more focused. 1.0 = disabled."
+                }),
+                "top_k": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 500,
+                    "step": 1,
+                    "tooltip": "Top-K sampling: only consider the K most likely tokens. Lower = more focused. 0 = disabled. Recommended: 20-40 for thinking models."
                 }),
                 "repeat_penalty": ("FLOAT", {
                     "default": 1.0,
@@ -162,11 +195,20 @@ class YANCLMStudio:
                     "step": 0.05,
                     "tooltip": "Penalizes repeated tokens. Higher values (1.1-1.3) reduce repetition. 1.0 = disabled."
                 }),
-                # --- Extraction and management ---
-                "reasoning_tag": ("STRING", {
-                    "default": "<think>",
-                    "tooltip": "Opening tag to identify reasoning sections (e.g., '<think>' for DeepSeek R1). Reasoning is extracted to separate output."
+                # --- Reasoning extraction ---
+                "reasoning_mode": (REASONING_MODE_OPTIONS, {
+                    "default": "Auto-detect (recommended)",
+                    "tooltip": "How to extract reasoning/thinking from model output. Auto-detect works with DeepSeek, Qwen, QwQ, GLM, GPT-OSS and similar models."
                 }),
+                "custom_open_tag": ("STRING", {
+                    "default": "<think>",
+                    "tooltip": "Custom opening tag for reasoning extraction. Only used when reasoning_mode is 'Custom tags'."
+                }),
+                "custom_close_tag": ("STRING", {
+                    "default": "</think>",
+                    "tooltip": "Custom closing tag for reasoning extraction. Only used when reasoning_mode is 'Custom tags'."
+                }),
+                # --- Management ---
                 "unload_llm": ("BOOLEAN", {
                     "default": True,
                     "tooltip": "Unload the LLM from LM Studio after generation. Recommended to free VRAM for image generation."
@@ -285,48 +327,64 @@ class YANCLMStudio:
             logger.error(f"Failed to convert image: {e}")
             return None
 
-    def _extract_reasoning(self, text: str, opening_tag: str) -> Tuple[str, str]:
+    def _extract_reasoning_auto(self, text: str) -> Tuple[str, str, Optional[str]]:
         """
-        Extract reasoning content from response.
+        Auto-detect and extract reasoning using common patterns.
 
         Args:
             text: Full response text
-            opening_tag: Opening tag like "<think>"
+
+        Returns:
+            Tuple of (response_without_reasoning, reasoning_content, detected_pattern)
+            detected_pattern is None if no pattern matched
+        """
+        for pattern, open_tag, close_tag in COMMON_REASONING_PATTERNS:
+            # Use DOTALL to match across newlines
+            matches = list(re.finditer(pattern, text, re.DOTALL))
+            if matches:
+                reasoning_parts = [m.group(1) for m in matches]
+                # Remove all matched reasoning blocks from text
+                clean_text = re.sub(pattern, "", text, flags=re.DOTALL)
+                return clean_text.strip(), "\n---\n".join(reasoning_parts).strip(), open_tag
+
+        # No pattern matched
+        return text, "", None
+
+    def _extract_reasoning_custom(self, text: str, open_tag: str, close_tag: str) -> Tuple[str, str]:
+        """
+        Extract reasoning using custom tags.
+
+        Args:
+            text: Full response text
+            open_tag: Opening tag
+            close_tag: Closing tag
 
         Returns:
             Tuple of (response_without_reasoning, reasoning_content)
         """
-        if not opening_tag or opening_tag not in text:
+        if not open_tag or open_tag not in text:
             return text, ""
-
-        # Derive closing tag
-        if opening_tag.startswith("<") and opening_tag.endswith(">"):
-            tag_name = opening_tag[1:-1]
-            closing_tag = f"</{tag_name}>"
-        else:
-            # Non-XML style tag - just use same tag as closer
-            closing_tag = opening_tag
 
         reasoning_parts = []
         response_text = text
 
         # Extract all reasoning blocks
-        while opening_tag in response_text:
-            start_idx = response_text.find(opening_tag)
-            end_idx = response_text.find(closing_tag, start_idx)
+        while open_tag in response_text:
+            start_idx = response_text.find(open_tag)
+            end_idx = response_text.find(close_tag, start_idx + len(open_tag))
 
             if end_idx == -1:
                 # No closing tag - take rest as reasoning
-                reasoning_parts.append(response_text[start_idx + len(opening_tag):])
+                reasoning_parts.append(response_text[start_idx + len(open_tag):])
                 response_text = response_text[:start_idx]
                 break
 
             # Extract reasoning content
-            reasoning_content = response_text[start_idx + len(opening_tag):end_idx]
+            reasoning_content = response_text[start_idx + len(open_tag):end_idx]
             reasoning_parts.append(reasoning_content)
 
             # Remove from response
-            response_text = response_text[:start_idx] + response_text[end_idx + len(closing_tag):]
+            response_text = response_text[:start_idx] + response_text[end_idx + len(close_tag):]
 
         return response_text.strip(), "\n---\n".join(reasoning_parts).strip()
 
@@ -347,8 +405,11 @@ class YANCLMStudio:
         draft_model_selection: str = CUSTOM_MODEL_OPTION,
         custom_draft_model: str = "",
         top_p: float = 1.0,
+        top_k: int = 0,
         repeat_penalty: float = 1.0,
-        reasoning_tag: str = "<think>",
+        reasoning_mode: str = "Auto-detect (recommended)",
+        custom_open_tag: str = "<think>",
+        custom_close_tag: str = "</think>",
         unload_llm: bool = True,
         unload_comfy_models: bool = False,
         refresh_models: bool = False
@@ -475,9 +536,11 @@ class YANCLMStudio:
                 }
 
                 # Add optional parameters if not at default
-                # Note: Parameter names per LM Studio SDK docs (topPSampling, not topP)
+                # Note: Parameter names per LM Studio SDK docs
                 if top_p < 1.0:
                     gen_config["topPSampling"] = top_p
+                if top_k > 0:
+                    gen_config["topKSampling"] = top_k
                 if repeat_penalty != 1.0:
                     gen_config["repeatPenalty"] = repeat_penalty
                 # Note: seed is not a valid inference-time parameter in LM Studio SDK
@@ -485,6 +548,8 @@ class YANCLMStudio:
                     gen_config["draftModel"] = draft_model
 
                 troubleshooting_lines.append(f"[INFO] Config: maxTokens={max_tokens}, temp={temperature}")
+                if top_k > 0:
+                    troubleshooting_lines.append(f"[INFO] Sampling: top_k={top_k}, top_p={top_p}")
                 troubleshooting_lines.append("[INFO] Generating...")
 
                 # Generate response
@@ -492,11 +557,27 @@ class YANCLMStudio:
                 response_text = str(response)
 
                 troubleshooting_lines.append("[INFO] Generation complete")
+                troubleshooting_lines.append(f"[INFO] Raw response length: {len(response_text)} chars")
 
-                # Extract reasoning if tag specified
-                final_response, reasoning = self._extract_reasoning(response_text, reasoning_tag)
+                # Extract reasoning based on mode
+                final_response = response_text
+                reasoning = ""
+
+                if reasoning_mode == "Auto-detect (recommended)":
+                    final_response, reasoning, detected_pattern = self._extract_reasoning_auto(response_text)
+                    if detected_pattern:
+                        troubleshooting_lines.append(f"[INFO] Auto-detected reasoning format: {detected_pattern}")
+                    elif response_text != final_response:
+                        troubleshooting_lines.append("[INFO] Reasoning extracted")
+                elif reasoning_mode == "Custom tags":
+                    final_response, reasoning = self._extract_reasoning_custom(
+                        response_text, custom_open_tag, custom_close_tag
+                    )
+                # else: "Disabled" - no extraction
+
                 if reasoning:
-                    troubleshooting_lines.append(f"[INFO] Extracted reasoning ({len(reasoning)} chars)")
+                    troubleshooting_lines.append(f"[INFO] Extracted reasoning: {len(reasoning)} chars")
+                    troubleshooting_lines.append(f"[INFO] Clean response: {len(final_response)} chars")
 
                 # Unload LLM if requested
                 if unload_llm:
